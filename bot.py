@@ -1,6 +1,7 @@
 import os
 import io
 import json
+import time
 import asyncio
 import logging
 from datetime import datetime
@@ -46,7 +47,7 @@ STATE_RENAME_NAME = "rename_name"
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.WARNING,
+    level=logging.INFO,
 )
 logging.getLogger("pyrogram").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
@@ -149,7 +150,7 @@ def combine_keyboard() -> InlineKeyboardMarkup:
 def split_method_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
-            [InlineKeyboardButton("◈ BY MAX SIZE (KB)", callback_data="split_size")],
+            [InlineKeyboardButton("◈ BY MAX SIZE (MB)", callback_data="split_size")],
             [InlineKeyboardButton("◈ BY NUMBER OF FILES", callback_data="split_count")],
             [InlineKeyboardButton("◈ BY MAX LINES", callback_data="split_lines")],
             [InlineKeyboardButton("◄ CANCEL", callback_data="cancel_split")],
@@ -584,12 +585,12 @@ async def on_callback(client: Client, callback: CallbackQuery):
         method = data.replace("split_", "")
         sess["split_method"] = method
         method_names = {
-            "size": "MAX SIZE (KB)",
+            "size": "MAX SIZE (MB)",
             "count": "NUMBER OF FILES",
             "lines": "MAX LINES PER FILE",
         }
         prompts = {
-            "size": "Enter maximum size per file in KB:",
+            "size": "Enter maximum size per file in MB:",
             "count": "Enter number of files to split into:",
             "lines": "Enter maximum lines per file:",
         }
@@ -1071,8 +1072,15 @@ async def handle_split_value(client: Client, message: Message, sess: Dict):
         reset_session(message.from_user.id)
         return
 
+    user_id = message.from_user.id
+    file_name = file_data["name"]
+    file_size_mb = file_data.get("raw_size", 0) / (1024 * 1024)
+    logger.info("SPLIT user=%s file=%s size=%.1fMB method=%s value=%s",
+                user_id, file_name, file_size_mb, method, value)
+
     content = file_data["content"]
     raw_lines = content.splitlines()
+    logger.info("SPLIT user=%s deduplicating %d lines...", user_id, len(raw_lines))
     seen = set()
     unique_lines = []
     for line in raw_lines:
@@ -1081,6 +1089,8 @@ async def handle_split_value(client: Client, message: Message, sess: Dict):
             unique_lines.append(line)
     dupes_removed = len(raw_lines) - len(unique_lines)
     lines = [line + "\n" for line in unique_lines]
+    logger.info("SPLIT user=%s unique lines=%d dupes_removed=%d",
+                user_id, len(unique_lines), dupes_removed)
 
     processing_text = f"""
 {HEADER}
@@ -1117,14 +1127,18 @@ async def handle_split_value(client: Client, message: Message, sess: Dict):
                     chunks.append("".join(chunk))
                 start = end
     elif method == "size":
-        max_bytes = value * 1024
+        max_bytes = value * 1024 * 1024  # MB → bytes
         current = ""
+        current_len = 0
         for line in lines:
-            if current and len((current + line).encode("utf-8")) > max_bytes:
+            line_len = len(line.encode("utf-8"))
+            if current and current_len + line_len > max_bytes:
                 chunks.append(current)
                 current = line
+                current_len = line_len
             else:
                 current += line
+                current_len += line_len
         if current:
             chunks.append(current)
     else:
@@ -1132,6 +1146,35 @@ async def handle_split_value(client: Client, message: Message, sess: Dict):
 
     if not chunks:
         chunks = [content]
+
+    # Guard against runaway chunk counts (would take forever to send)
+    MAX_CHUNKS = 500
+    if len(chunks) > MAX_CHUNKS:
+        logger.warning("SPLIT user=%s chunk count %d exceeds cap %d — aborting",
+                       user_id, len(chunks), MAX_CHUNKS)
+        abort_text = f"""
+{HEADER}
+
+           ⚠ TOO MANY PARTS
+
+{DIVIDER}
+
+  ► Requested: {len(chunks)} files
+  ► Maximum allowed: {MAX_CHUNKS} files
+
+  This would take too long to send.
+  Try a larger size / fewer files.
+
+{DIVIDER}"""
+        if status_msg:
+            try:
+                await status_msg.edit_text(abort_text, reply_markup=back_keyboard())
+            except Exception:
+                pass
+        reset_session(user_id)
+        return
+
+    logger.info("SPLIT user=%s split into %d chunks", user_id, len(chunks))
 
     result_text = f"""
 {HEADER}
@@ -1144,6 +1187,8 @@ async def handle_split_value(client: Client, message: Message, sess: Dict):
   ► Duplicates removed: {dupes_removed}
   ► Output format: TXT
 
+  Sending {len(chunks)} file(s)...
+
 {DIVIDER}"""
     if status_msg:
         try:
@@ -1154,9 +1199,12 @@ async def handle_split_value(client: Client, message: Message, sess: Dict):
         await safe_send(client, message.chat.id, result_text, reply_markup=back_keyboard())
 
     base_name = os.path.splitext(file_data["name"])[0]
+    ext = os.path.splitext(file_data["name"])[1] or ".txt"
+    t0 = time.monotonic()
     for i, chunk in enumerate(chunks, 1):
-        ext = os.path.splitext(file_data["name"])[1] or ".txt"
         fname = f"{base_name}_part{i:03d}{ext}"
+        logger.info("SPLIT user=%s sending part %d/%d (%s, %.1f KB)",
+                    user_id, i, len(chunks), fname, len(chunk.encode("utf-8")) / 1024)
         await send_document_bytes(
             client, message.chat.id,
             chunk.encode("utf-8"),
@@ -1164,8 +1212,10 @@ async def handle_split_value(client: Client, message: Message, sess: Dict):
             f"► Part {i} of {len(chunks)}",
         )
         await asyncio.sleep(0.3)
+    logger.info("SPLIT user=%s done — %d files sent in %.1fs",
+                user_id, len(chunks), time.monotonic() - t0)
 
-    reset_session(message.from_user.id)
+    reset_session(user_id)
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #                              MAKE TXT
