@@ -1,39 +1,44 @@
 import os
-import logging
+import io
 import json
-import tempfile
 import asyncio
+import logging
 from datetime import datetime
-from typing import Dict, List
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, Document
-from telegram.ext import (
-    Application,
-    CommandHandler,
-    MessageHandler,
-    CallbackQueryHandler,
-    ContextTypes,
-    ConversationHandler,
-    filters,
+from typing import Dict, List, Optional
+
+from pyrogram import Client, filters
+from pyrogram.types import (
+    Message,
+    CallbackQuery,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
 )
+from pyrogram.errors import FloodWait
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #                              CONFIGURATION
 # ═══════════════════════════════════════════════════════════════════════════════
 
 BOT_TOKEN = "8622917685:AAECVP2-vTmbaef2FC6uOFHFvR5H0K_WLsE"
+API_ID = 25621841
+API_HASH = "083efc80016252b6b88bc476bb4ea724"
+
 DATA_FILE = "users_data.json"
 
-# Conversation states
-COMBINE_WAITING = 1
-SPLIT_WAITING = 2
-SPLIT_METHOD = 3
-SPLIT_VALUE = 4
-MAKETXT_WAITING = 5
-CSVTOTXT_WAITING = 6
-REMOVEDUPE_WAITING_FILE1 = 7
-REMOVEDUPE_WAITING_FILE2 = 8
-RENAME_WAITING_FILE = 9
-RENAME_WAITING_NAME = 10
+# Pyrogram (MTProto) bot token download/upload limit is 2 GB.
+MAX_FILE_SIZE_BYTES = 2 * 1024 * 1024 * 1024  # 2 GB
+
+# Session states
+STATE_IDLE = "idle"
+STATE_COMBINE = "combine"
+STATE_SPLIT = "split"
+STATE_SPLIT_METHOD = "split_method"
+STATE_SPLIT_VALUE = "split_value"
+STATE_MAKETXT = "maketxt"
+STATE_CSVTOTXT = "csvtotxt"
+STATE_REMOVEDUPE = "removedupe"
+STATE_RENAME_FILE = "rename_file"
+STATE_RENAME_NAME = "rename_name"
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #                              LOGGING SETUP
@@ -41,10 +46,9 @@ RENAME_WAITING_NAME = 10
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.WARNING
+    level=logging.WARNING,
 )
-logging.getLogger("httpx").setLevel(logging.WARNING)
-logging.getLogger("telegram").setLevel(logging.WARNING)
+logging.getLogger("pyrogram").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -52,29 +56,43 @@ logger = logging.getLogger(__name__)
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def load_users() -> Dict:
-    """Load users data from JSON file."""
     if os.path.exists(DATA_FILE):
-        with open(DATA_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
+        try:
+            with open(DATA_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return {}
     return {}
 
 def save_users(users: Dict) -> None:
-    """Save users data to JSON file."""
     with open(DATA_FILE, "w", encoding="utf-8") as f:
         json.dump(users, f, indent=2, ensure_ascii=False)
 
 def register_user(user) -> None:
-    """Register or update user in database."""
     users = load_users()
-    user_id = str(user.id)
-    users[user_id] = {
+    uid = str(user.id)
+    users[uid] = {
         "id": user.id,
         "first_name": user.first_name or "",
         "last_name": user.last_name or "",
         "username": user.username or "",
-        "last_active": datetime.now().isoformat()
+        "last_active": datetime.now().isoformat(),
     }
     save_users(users)
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#                              SESSION STATE
+# ═══════════════════════════════════════════════════════════════════════════════
+
+sessions: Dict[int, Dict] = {}
+
+def get_session(user_id: int) -> Dict:
+    if user_id not in sessions:
+        sessions[user_id] = {"state": STATE_IDLE}
+    return sessions[user_id]
+
+def reset_session(user_id: int) -> None:
+    sessions.pop(user_id, None)
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #                              UI COMPONENTS
@@ -89,7 +107,6 @@ HEADER = """
 DIVIDER = "━" * 40
 
 def main_menu_keyboard() -> InlineKeyboardMarkup:
-    """Create main menu keyboard."""
     keyboard = [
         [
             InlineKeyboardButton("◈ COMBINER ◈", callback_data="combine"),
@@ -111,64 +128,170 @@ def main_menu_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(keyboard)
 
 def back_keyboard() -> InlineKeyboardMarkup:
-    """Create back button keyboard."""
-    keyboard = [[InlineKeyboardButton("◄ BACK TO MENU", callback_data="menu")]]
-    return InlineKeyboardMarkup(keyboard)
-
-def combine_keyboard() -> InlineKeyboardMarkup:
-    """Create combiner action keyboard."""
-    keyboard = [
-        [InlineKeyboardButton("▶ COMBINE NOW", callback_data="do_combine")],
-        [InlineKeyboardButton("✕ CLEAR FILES", callback_data="clear_combine")],
-        [InlineKeyboardButton("◄ CANCEL", callback_data="cancel_combine")],
-    ]
-    return InlineKeyboardMarkup(keyboard)
-
-def split_method_keyboard() -> InlineKeyboardMarkup:
-    """Create split method selection keyboard."""
-    keyboard = [
-        [InlineKeyboardButton("◈ BY MAX SIZE (KB)", callback_data="split_size")],
-        [InlineKeyboardButton("◈ BY NUMBER OF FILES", callback_data="split_count")],
-        [InlineKeyboardButton("◈ BY MAX LINES", callback_data="split_lines")],
-        [InlineKeyboardButton("◄ CANCEL", callback_data="cancel_split")],
-    ]
-    return InlineKeyboardMarkup(keyboard)
+    return InlineKeyboardMarkup(
+        [[InlineKeyboardButton("◄ BACK TO MENU", callback_data="menu")]]
+    )
 
 def cancel_keyboard() -> InlineKeyboardMarkup:
-    """Create cancel keyboard."""
-    keyboard = [[InlineKeyboardButton("◄ CANCEL", callback_data="menu")]]
-    return InlineKeyboardMarkup(keyboard)
+    return InlineKeyboardMarkup(
+        [[InlineKeyboardButton("◄ CANCEL", callback_data="menu")]]
+    )
+
+def combine_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("▶ COMBINE NOW", callback_data="do_combine")],
+            [InlineKeyboardButton("✕ CLEAR FILES", callback_data="clear_combine")],
+            [InlineKeyboardButton("◄ CANCEL", callback_data="cancel_combine")],
+        ]
+    )
+
+def split_method_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("◈ BY MAX SIZE (KB)", callback_data="split_size")],
+            [InlineKeyboardButton("◈ BY NUMBER OF FILES", callback_data="split_count")],
+            [InlineKeyboardButton("◈ BY MAX LINES", callback_data="split_lines")],
+            [InlineKeyboardButton("◄ CANCEL", callback_data="cancel_split")],
+        ]
+    )
 
 def maketxt_keyboard() -> InlineKeyboardMarkup:
-    """Create make txt action keyboard."""
-    keyboard = [
-        [InlineKeyboardButton("▶ CREATE TXT", callback_data="do_maketxt")],
-        [InlineKeyboardButton("✕ CLEAR LINES", callback_data="clear_maketxt")],
-        [InlineKeyboardButton("◄ CANCEL", callback_data="cancel_maketxt")],
-    ]
-    return InlineKeyboardMarkup(keyboard)
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("▶ CREATE TXT", callback_data="do_maketxt")],
+            [InlineKeyboardButton("✕ CLEAR LINES", callback_data="clear_maketxt")],
+            [InlineKeyboardButton("◄ CANCEL", callback_data="cancel_maketxt")],
+        ]
+    )
 
 def removedupe_keyboard() -> InlineKeyboardMarkup:
-    """Create remove-common action keyboard."""
-    keyboard = [
-        [InlineKeyboardButton("✕ CLEAR FILES", callback_data="clear_removedupe")],
-        [InlineKeyboardButton("◄ CANCEL", callback_data="cancel_removedupe")],
-    ]
-    return InlineKeyboardMarkup(keyboard)
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("✕ CLEAR FILES", callback_data="clear_removedupe")],
+            [InlineKeyboardButton("◄ CANCEL", callback_data="cancel_removedupe")],
+        ]
+    )
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#                              COMMAND HANDLERS
+#                              HELPER: SAFE REPLY
 # ═══════════════════════════════════════════════════════════════════════════════
 
-async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Handle /start command."""
-    user = update.effective_user
-    register_user(user)
-    
-    welcome_text = f"""
+_flood_until = 0.0
+
+async def safe_send(client, chat_id, text, reply_markup=None, reply_to_message_id=None):
+    """Send a message, swallowing FloodWait."""
+    global _flood_until
+    import time
+    now = time.monotonic()
+    if now < _flood_until:
+        return None
+    try:
+        return await client.send_message(
+            chat_id,
+            text,
+            reply_markup=reply_markup,
+            reply_to_message_id=reply_to_message_id,
+            disable_web_page_preview=True,
+        )
+    except FloodWait as e:
+        _flood_until = now + e.value
+        logger.warning("FloodWait %ds on send_message, skipping", e.value)
+        return None
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#                              FILE DOWNLOAD/UPLOAD HELPERS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+async def download_file_bytes(client, message: Message) -> Optional[bytes]:
+    """Download a file via Pyrogram MTProto (up to 2GB). Returns bytes or None on error."""
+    try:
+        # in_memory=True returns a BytesIO-like object directly
+        buf = await client.download_media(message, in_memory=True)
+        if buf is None:
+            return None
+        # pyrogram returns io.BytesIO when in_memory=True
+        if isinstance(buf, io.BytesIO):
+            return buf.getvalue()
+        if isinstance(buf, (bytes, bytearray)):
+            return bytes(buf)
+        # Fallback: read from file-like
+        if hasattr(buf, "read"):
+            return buf.read()
+        return None
+    except FloodWait as e:
+        await asyncio.sleep(e.value + 1)
+        try:
+            buf = await client.download_media(message, in_memory=True)
+            if isinstance(buf, io.BytesIO):
+                return buf.getvalue()
+            if isinstance(buf, (bytes, bytearray)):
+                return bytes(buf)
+            if hasattr(buf, "read"):
+                return buf.read()
+        except Exception as ex:
+            logger.error("Retry download failed: %s", ex)
+        return None
+    except Exception as e:
+        logger.error("Download failed: %s", e)
+        return None
+
+async def send_document_bytes(client, chat_id, content: bytes, filename: str, caption: str = ""):
+    """Send bytes as a document via Pyrogram MTProto (up to 2GB)."""
+    bio = io.BytesIO(content)
+    bio.name = filename
+    await client.send_document(
+        chat_id,
+        document=bio,
+        file_name=filename,
+        caption=caption,
+    )
+
+async def send_document_file(client, chat_id, file_path: str, filename: str, caption: str = ""):
+    """Send a file from disk by path (used for rename's binary passthrough)."""
+    await client.send_document(
+        chat_id,
+        document=file_path,
+        file_name=filename,
+        caption=caption,
+    )
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#                              STATS DISPLAY
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def build_stats_text() -> str:
+    users = load_users()
+    total = len(users)
+    if total == 0:
+        body = "    No users registered yet\n"
+    else:
+        body = ""
+        for idx, (uid, data) in enumerate(users.items(), 1):
+            name = f"{data.get('first_name', '')} {data.get('last_name', '')}".strip()
+            username = data.get("username", "")
+            uname = f"@{username}" if username else "[no username]"
+            body += f"  {idx:03d}. {name[:15]:<15} {uname}\n"
+    return f"""
 {HEADER}
 
-  Welcome, {user.first_name}!
+         USER STATISTICS
+
+{DIVIDER}
+  Total Users: {total}
+{DIVIDER}
+
+{body}
+{DIVIDER}"""
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#                              START / HELP / STATS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+WELCOME_TEXT = f"""
+{HEADER}
+
+  Welcome, {{name}}!
 
 {DIVIDER}
 
@@ -194,25 +317,14 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     Rename any file with full
     new name (incl. extension)
 
+  ► Max file size: 2 GB
+  ► Duplicates removed automatically
+
 {DIVIDER}
       Select an option below
 {DIVIDER}"""
-    
-    # Clear any previous session data
-    context.user_data.clear()
-    
-    await update.message.reply_text(
-        welcome_text,
-        reply_markup=main_menu_keyboard(),
-        parse_mode=None
-    )
-    return ConversationHandler.END
 
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle /help command."""
-    register_user(update.effective_user)
-    
-    help_text = f"""
+HELP_TEXT = f"""
 {HEADER}
 
            HELP GUIDE
@@ -250,94 +362,31 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
        files are removed
     4. Receive 2 output files
        (one per input)
+    Whitespace trimmed when
+    matching; order preserved
 
   ► RENAME
     1. Select RENAME
-    2. Send any file
+    2. Send any file (any type)
     3. Type a new full filename
        (incl. extension, e.g. .py)
     4. Receive file with new name
+    No validation; no extension
+    auto-appended; binary-safe
 
   ► COMMANDS
     /start  - Main menu
     /help   - This guide
     /stats  - User statistics
+    /cancel - Cancel current op
 
   ► NOTE
-    Duplicates removed automatically
+    • Max file size: 2 GB
+    • Duplicates removed automatically
 
 {DIVIDER}"""
-    
-    await update.message.reply_text(help_text, reply_markup=back_keyboard())
 
-async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle /stats command."""
-    register_user(update.effective_user)
-    await show_stats(update, context)
-
-async def show_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Display user statistics."""
-    users = load_users()
-    total_users = len(users)
-    
-    if total_users == 0:
-        stats_text = f"""
-{HEADER}
-
-         USER STATISTICS
-
-{DIVIDER}
-
-    No users registered yet
-
-{DIVIDER}"""
-    else:
-        user_list = ""
-        for idx, (uid, data) in enumerate(users.items(), 1):
-            name = f"{data.get('first_name', '')} {data.get('last_name', '')}".strip()
-            username = data.get('username', '')
-            username_display = f"@{username}" if username else "[no username]"
-            user_list += f"  {idx:03d}. {name[:15]:<15} {username_display}\n"
-        
-        stats_text = f"""
-{HEADER}
-
-         USER STATISTICS
-
-{DIVIDER}
-  Total Users: {total_users}
-{DIVIDER}
-
-{user_list}
-{DIVIDER}"""
-    
-    if update.callback_query:
-        await update.callback_query.edit_message_text(
-            stats_text,
-            reply_markup=back_keyboard()
-        )
-    else:
-        await update.message.reply_text(stats_text, reply_markup=back_keyboard())
-
-# ═══════════════════════════════════════════════════════════════════════════════
-#                              CALLBACK HANDLERS
-# ═══════════════════════════════════════════════════════════════════════════════
-
-async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Handle button callbacks."""
-    query = update.callback_query
-    await query.answer()
-    
-    register_user(update.effective_user)
-    data = query.data
-    
-    # ─────────────────────────────────────────────────────────────────────────
-    # MENU NAVIGATION
-    # ─────────────────────────────────────────────────────────────────────────
-    
-    if data == "menu":
-        context.user_data.clear()
-        menu_text = f"""
+MENU_TEXT = f"""
 {HEADER}
 
             MAIN MENU
@@ -351,73 +400,98 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
   ◈ RM COMMON - Remove common lines
   ◈ RENAME   - Rename any file
 
+  ► Max file size: 2 GB
+
 {DIVIDER}
       Select an option below
 {DIVIDER}"""
-        await query.edit_message_text(menu_text, reply_markup=main_menu_keyboard())
-        return ConversationHandler.END
-    
-    elif data == "help":
-        help_text = f"""
-{HEADER}
 
-           HELP GUIDE
+# ═══════════════════════════════════════════════════════════════════════════════
+#                              APPLICATION
+# ═══════════════════════════════════════════════════════════════════════════════
 
-{DIVIDER}
+app = Client(
+    "file_toolkit_bot",
+    api_id=API_ID,
+    api_hash=API_HASH,
+    bot_token=BOT_TOKEN,
+    workers=8,
+    max_concurrent_transmissions=10,
+)
 
-  ► COMBINER
-    1. Select COMBINER
-    2. Send multiple TXT/CSV files
-    3. Click COMBINE NOW
-    4. Receive merged TXT file
+# ───────────────────────────────────────────────────────────────────────────────
+# COMMAND HANDLERS
+# ───────────────────────────────────────────────────────────────────────────────
 
-  ► SPLITTER
-    1. Select SPLITTER
-    2. Send a TXT/CSV file
-    3. Choose split method
-    4. Enter the value
-    5. Receive split TXT files
+@app.on_message(filters.command("start") & filters.private)
+async def cmd_start(client: Client, message: Message):
+    user = message.from_user
+    register_user(user)
+    reset_session(user.id)
+    text = WELCOME_TEXT.format(name=user.first_name or "user")
+    await message.reply(text, reply_markup=main_menu_keyboard(), disable_web_page_preview=True)
 
-  ► MAKE TXT
-    1. Select MAKE TXT
-    2. Send text messages
-    3. Click CREATE TXT
-    4. Receive TXT file
+@app.on_message(filters.command("help") & filters.private)
+async def cmd_help(client: Client, message: Message):
+    register_user(message.from_user)
+    await message.reply(HELP_TEXT, reply_markup=back_keyboard(), disable_web_page_preview=True)
 
-  ► RM COMMON
-    1. Select RM COMMON
-    2. Send 2 text files
-    3. Lines common to BOTH
-       files are removed
-    4. Receive 2 output files
+@app.on_message(filters.command("stats") & filters.private)
+async def cmd_stats(client: Client, message: Message):
+    register_user(message.from_user)
+    await message.reply(build_stats_text(), reply_markup=back_keyboard(), disable_web_page_preview=True)
 
-  ► RENAME
-    1. Select RENAME
-    2. Send any file
-    3. Type a new full filename
-       (incl. extension, e.g. .py)
-    4. Receive file with new name
+@app.on_message(filters.command("cancel") & filters.private)
+async def cmd_cancel(client: Client, message: Message):
+    reset_session(message.from_user.id)
+    await message.reply(
+        "Operation cancelled. Use /start to begin again.",
+        reply_markup=back_keyboard(),
+    )
 
-  ► NOTE
-    Duplicates removed automatically
+# ───────────────────────────────────────────────────────────────────────────────
+# CALLBACK QUERY DISPATCHER
+# ───────────────────────────────────────────────────────────────────────────────
 
-{DIVIDER}"""
-        await query.edit_message_text(help_text, reply_markup=back_keyboard())
-        return ConversationHandler.END
-    
-    elif data == "stats":
-        await show_stats(update, context)
-        return ConversationHandler.END
-    
-    # ─────────────────────────────────────────────────────────────────────────
-    # COMBINER
-    # ─────────────────────────────────────────────────────────────────────────
-    
-    elif data == "combine":
-        context.user_data["combine_files"] = []
-        context.user_data["mode"] = "combine"
-        
-        combine_text = f"""
+@app.on_callback_query(filters.regex(r"^.+$"))
+async def on_callback(client: Client, callback: CallbackQuery):
+    user_id = callback.from_user.id
+    register_user(callback.from_user)
+    sess = get_session(user_id)
+    data = callback.data
+
+    # ── MENU NAVIGATION ──
+    if data == "menu":
+        reset_session(user_id)
+        sess = get_session(user_id)
+        try:
+            await callback.edit_message_text(MENU_TEXT, reply_markup=main_menu_keyboard())
+        except Exception:
+            pass
+        await callback.answer()
+        return
+
+    if data == "help":
+        try:
+            await callback.edit_message_text(HELP_TEXT, reply_markup=back_keyboard())
+        except Exception:
+            pass
+        await callback.answer()
+        return
+
+    if data == "stats":
+        try:
+            await callback.edit_message_text(build_stats_text(), reply_markup=back_keyboard())
+        except Exception:
+            pass
+        await callback.answer()
+        return
+
+    # ── COMBINER ──
+    if data == "combine":
+        sess["state"] = STATE_COMBINE
+        sess["combine_files"] = []
+        text = f"""
 {HEADER}
 
             COMBINER
@@ -427,28 +501,29 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
   ► Send TXT or CSV files
   ► Files will be merged by lines
   ► Output: single TXT file
+  ► Max file size: 2 GB
 
   Files received: 0
 
 {DIVIDER}
       Send your files below
 {DIVIDER}"""
-        
-        await query.edit_message_text(combine_text, reply_markup=combine_keyboard())
-        return COMBINE_WAITING
-    
-    elif data == "do_combine":
-        files = context.user_data.get("combine_files", [])
+        await callback.edit_message_text(text, reply_markup=combine_keyboard())
+        await callback.answer()
+        return
+
+    if data == "do_combine":
+        files = sess.get("combine_files", [])
         if len(files) < 2:
-            await query.answer("Please send at least 2 files to combine!", show_alert=True)
-            return COMBINE_WAITING
-        
-        await do_combine_files(update, context)
-        return ConversationHandler.END
-    
-    elif data == "clear_combine":
-        context.user_data["combine_files"] = []
-        combine_text = f"""
+            await callback.answer("Please send at least 2 files to combine!", show_alert=True)
+            return
+        await do_combine_files(client, callback, sess, user_id)
+        await callback.answer()
+        return
+
+    if data == "clear_combine":
+        sess["combine_files"] = []
+        text = f"""
 {HEADER}
 
             COMBINER
@@ -463,22 +538,21 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 {DIVIDER}
       Send your files below
 {DIVIDER}"""
-        await query.edit_message_text(combine_text, reply_markup=combine_keyboard())
-        return COMBINE_WAITING
-    
-    elif data == "cancel_combine":
-        context.user_data.clear()
-        return await button_callback_menu(update, context)
-    
-    # ─────────────────────────────────────────────────────────────────────────
-    # SPLITTER
-    # ─────────────────────────────────────────────────────────────────────────
-    
-    elif data == "split":
-        context.user_data["mode"] = "split"
-        context.user_data["split_file"] = None
-        
-        split_text = f"""
+        await callback.edit_message_text(text, reply_markup=combine_keyboard())
+        await callback.answer()
+        return
+
+    if data == "cancel_combine":
+        reset_session(user_id)
+        await _go_menu(callback)
+        await callback.answer()
+        return
+
+    # ── SPLITTER ──
+    if data == "split":
+        sess["state"] = STATE_SPLIT
+        sess["split_file"] = None
+        text = f"""
 {HEADER}
 
             SPLITTER
@@ -488,58 +562,61 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
   ► Send a TXT or CSV file
   ► Choose split method
   ► Output: multiple TXT files
+  ► Max file size: 2 GB
 
   Waiting for file...
 
 {DIVIDER}
        Send your file below
 {DIVIDER}"""
-        
-        keyboard = [[InlineKeyboardButton("◄ CANCEL", callback_data="cancel_split")]]
-        await query.edit_message_text(split_text, reply_markup=InlineKeyboardMarkup(keyboard))
-        return SPLIT_WAITING
-    
-    elif data == "cancel_split":
-        context.user_data.clear()
-        return await button_callback_menu(update, context)
-    
-    elif data.startswith("split_"):
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("◄ CANCEL", callback_data="cancel_split")]])
+        await callback.edit_message_text(text, reply_markup=kb)
+        await callback.answer()
+        return
+
+    if data == "cancel_split":
+        reset_session(user_id)
+        await _go_menu(callback)
+        await callback.answer()
+        return
+
+    if data.startswith("split_") and data not in ("split_method_back",):
         method = data.replace("split_", "")
-        context.user_data["split_method"] = method
-        
+        sess["split_method"] = method
         method_names = {
             "size": "MAX SIZE (KB)",
             "count": "NUMBER OF FILES",
-            "lines": "MAX LINES PER FILE"
+            "lines": "MAX LINES PER FILE",
         }
-        
         prompts = {
             "size": "Enter maximum size per file in KB:",
             "count": "Enter number of files to split into:",
-            "lines": "Enter maximum lines per file:"
+            "lines": "Enter maximum lines per file:",
         }
-        
-        value_text = f"""
+        m = method_names.get(method, method.upper())
+        p = prompts.get(method, "Enter value:")
+        text = f"""
 {HEADER}
 
             SPLITTER
 
 {DIVIDER}
 
-  Method: {method_names[method]}
+  Method: {m}
 
-  {prompts[method]}
+  {p}
 
 {DIVIDER}
        Type a number below
 {DIVIDER}"""
-        
-        keyboard = [[InlineKeyboardButton("◄ BACK", callback_data="split_method_back")]]
-        await query.edit_message_text(value_text, reply_markup=InlineKeyboardMarkup(keyboard))
-        return SPLIT_VALUE
-    
-    elif data == "split_method_back":
-        split_text = f"""
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("◄ BACK", callback_data="split_method_back")]])
+        await callback.edit_message_text(text, reply_markup=kb)
+        sess["state"] = STATE_SPLIT_VALUE
+        await callback.answer()
+        return
+
+    if data == "split_method_back":
+        text = f"""
 {HEADER}
 
             SPLITTER
@@ -552,18 +629,16 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 {DIVIDER}
       Select split method
 {DIVIDER}"""
-        await query.edit_message_text(split_text, reply_markup=split_method_keyboard())
-        return SPLIT_METHOD
-    
-    # ─────────────────────────────────────────────────────────────────────────
-    # MAKE TXT
-    # ─────────────────────────────────────────────────────────────────────────
-    
-    elif data == "maketxt":
-        context.user_data["maketxt_lines"] = []
-        context.user_data["mode"] = "maketxt"
-        
-        maketxt_text = f"""
+        await callback.edit_message_text(text, reply_markup=split_method_keyboard())
+        sess["state"] = STATE_SPLIT_METHOD
+        await callback.answer()
+        return
+
+    # ── MAKE TXT ──
+    if data == "maketxt":
+        sess["state"] = STATE_MAKETXT
+        sess["maketxt_lines"] = []
+        text = f"""
 {HEADER}
 
             MAKE TXT
@@ -579,22 +654,22 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 {DIVIDER}
        Send your text below
 {DIVIDER}"""
-        
-        await query.edit_message_text(maketxt_text, reply_markup=maketxt_keyboard())
-        return MAKETXT_WAITING
-    
-    elif data == "do_maketxt":
-        lines = context.user_data.get("maketxt_lines", [])
+        await callback.edit_message_text(text, reply_markup=maketxt_keyboard())
+        await callback.answer()
+        return
+
+    if data == "do_maketxt":
+        lines = sess.get("maketxt_lines", [])
         if len(lines) < 1:
-            await query.answer("Please send at least 1 line of text!", show_alert=True)
-            return MAKETXT_WAITING
-        
-        await do_maketxt(update, context)
-        return ConversationHandler.END
-    
-    elif data == "clear_maketxt":
-        context.user_data["maketxt_lines"] = []
-        maketxt_text = f"""
+            await callback.answer("Please send at least 1 line of text!", show_alert=True)
+            return
+        await do_maketxt(client, callback, sess, user_id)
+        await callback.answer()
+        return
+
+    if data == "clear_maketxt":
+        sess["maketxt_lines"] = []
+        text = f"""
 {HEADER}
 
             MAKE TXT
@@ -609,21 +684,20 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 {DIVIDER}
        Send your text below
 {DIVIDER}"""
-        await query.edit_message_text(maketxt_text, reply_markup=maketxt_keyboard())
-        return MAKETXT_WAITING
-    
-    elif data == "cancel_maketxt":
-        context.user_data.clear()
-        return await button_callback_menu(update, context)
-    
-    # ─────────────────────────────────────────────────────────────────────────
-    # CSV TO TXT
-    # ─────────────────────────────────────────────────────────────────────────
-    
-    elif data == "csvtotxt":
-        context.user_data["mode"] = "csvtotxt"
-        
-        csvtotxt_text = f"""
+        await callback.edit_message_text(text, reply_markup=maketxt_keyboard())
+        await callback.answer()
+        return
+
+    if data == "cancel_maketxt":
+        reset_session(user_id)
+        await _go_menu(callback)
+        await callback.answer()
+        return
+
+    # ── CSV TO TXT ──
+    if data == "csvtotxt":
+        sess["state"] = STATE_CSVTOTXT
+        text = f"""
 {HEADER}
 
            CSV → TXT
@@ -633,33 +707,32 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
   ► Send a CSV file
   ► Converts to TXT format
   ► Duplicates auto-removed
+  ► Max file size: 2 GB
 
   Waiting for file...
 
 {DIVIDER}
      Send your CSV file below
 {DIVIDER}"""
-        
-        keyboard = [[InlineKeyboardButton("◄ CANCEL", callback_data="cancel_csvtotxt")]]
-        await query.edit_message_text(csvtotxt_text, reply_markup=InlineKeyboardMarkup(keyboard))
-        return CSVTOTXT_WAITING
-    
-    elif data == "cancel_csvtotxt":
-        context.user_data.clear()
-        return await button_callback_menu(update, context)
-    
-    # ─────────────────────────────────────────────────────────────────────────
-    # REMOVE COMMON LINES
-    # ─────────────────────────────────────────────────────────────────────────
-    
-    elif data == "removedupe":
-        context.user_data["removedupe_files"] = []
-        context.user_data["mode"] = "removedupe"
-        
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("◄ CANCEL", callback_data="cancel_csvtotxt")]])
+        await callback.edit_message_text(text, reply_markup=kb)
+        await callback.answer()
+        return
+
+    if data == "cancel_csvtotxt":
+        reset_session(user_id)
+        await _go_menu(callback)
+        await callback.answer()
+        return
+
+    # ── REMOVE COMMON LINES ──
+    if data == "removedupe":
+        sess["state"] = STATE_REMOVEDUPE
+        sess["removedupe_files"] = []
         text = f"""
 {HEADER}
 
-          REMOVE COMMON LINES
+        REMOVE COMMON LINES
 
 {DIVIDER}
 
@@ -669,22 +742,23 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
   ► Whitespace trimmed when
     matching; order preserved
   ► Output: 2 separate files
+  ► Max file size: 2 GB
 
   Files received: 0
 
 {DIVIDER}
       Send your files below
 {DIVIDER}"""
-        
-        await query.edit_message_text(text, reply_markup=removedupe_keyboard())
-        return REMOVEDUPE_WAITING_FILE1
-    
-    elif data == "clear_removedupe":
-        context.user_data["removedupe_files"] = []
+        await callback.edit_message_text(text, reply_markup=removedupe_keyboard())
+        await callback.answer()
+        return
+
+    if data == "clear_removedupe":
+        sess["removedupe_files"] = []
         text = f"""
 {HEADER}
 
-          REMOVE COMMON LINES
+        REMOVE COMMON LINES
 
 {DIVIDER}
 
@@ -696,21 +770,20 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 {DIVIDER}
       Send your files below
 {DIVIDER}"""
-        await query.edit_message_text(text, reply_markup=removedupe_keyboard())
-        return REMOVEDUPE_WAITING_FILE1
-    
-    elif data == "cancel_removedupe":
-        context.user_data.clear()
-        return await button_callback_menu(update, context)
-    
-    # ─────────────────────────────────────────────────────────────────────────
-    # RENAME
-    # ─────────────────────────────────────────────────────────────────────────
-    
-    elif data == "rename":
-        context.user_data["mode"] = "rename"
-        context.user_data["rename_file"] = None
-        
+        await callback.edit_message_text(text, reply_markup=removedupe_keyboard())
+        await callback.answer()
+        return
+
+    if data == "cancel_removedupe":
+        reset_session(user_id)
+        await _go_menu(callback)
+        await callback.answer()
+        return
+
+    # ── RENAME ──
+    if data == "rename":
+        sess["state"] = STATE_RENAME_FILE
+        sess["rename_file"] = None
         text = f"""
 {HEADER}
 
@@ -719,112 +792,132 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 {DIVIDER}
 
   ► Send ANY file to rename
+    (any type, any size up to 2GB)
   ► Then type the NEW full
     filename (incl. extension,
     e.g. .txt, .py, .csv)
   ► No validation enforced
+  ► No extension auto-appended
+  ► Binary-safe passthrough
 
   Waiting for file...
 
 {DIVIDER}
        Send your file below
 {DIVIDER}"""
-        
-        keyboard = [[InlineKeyboardButton("◄ CANCEL", callback_data="cancel_rename")]]
-        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
-        return RENAME_WAITING_FILE
-    
-    elif data == "cancel_rename":
-        context.user_data.clear()
-        return await button_callback_menu(update, context)
-    
-    return ConversationHandler.END
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("◄ CANCEL", callback_data="cancel_rename")]])
+        await callback.edit_message_text(text, reply_markup=kb)
+        await callback.answer()
+        return
 
-async def button_callback_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Return to main menu."""
-    query = update.callback_query
-    context.user_data.clear()
-    
-    menu_text = f"""
-{HEADER}
+    if data == "cancel_rename":
+        reset_session(user_id)
+        await _go_menu(callback)
+        await callback.answer()
+        return
 
-            MAIN MENU
+    await callback.answer()
 
-{DIVIDER}
-
-  ◈ COMBINER - Merge files
-  ◈ SPLITTER - Split files
-  ◈ MAKE TXT - Text to file
-  ◈ CSV→TXT  - Convert CSV
-  ◈ RM COMMON - Remove common lines
-  ◈ RENAME   - Rename any file
-
-{DIVIDER}
-      Select an option below
-{DIVIDER}"""
-    
-    await query.edit_message_text(menu_text, reply_markup=main_menu_keyboard())
-    return ConversationHandler.END
-
-# ═══════════════════════════════════════════════════════════════════════════════
-#                              FILE HANDLERS
-# ═══════════════════════════════════════════════════════════════════════════════
-
-async def handle_combine_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Handle file upload for combining."""
-    document = update.message.document
-    
-    if not document:
-        await update.message.reply_text("Please send a valid file.")
-        return COMBINE_WAITING
-    
-    file_name = document.file_name.lower()
-    if not (file_name.endswith('.txt') or file_name.endswith('.csv')):
-        await update.message.reply_text(
-            "⚠ Only TXT and CSV files are supported!",
-            reply_markup=combine_keyboard()
-        )
-        return COMBINE_WAITING
-    
-    # Check file size (Telegram bot API limit is 20MB)
-    if document.file_size > 20 * 1024 * 1024:
-        await update.message.reply_text(
-            "⚠ File too large! Maximum size is 20MB.",
-            reply_markup=combine_keyboard()
-        )
-        return COMBINE_WAITING
-    
-    # Delete previous status message if exists
-    if "combine_status_msg" in context.user_data:
-        try:
-            await context.user_data["combine_status_msg"].delete()
-        except Exception:
-            pass
-    
-    # Download file
+async def _go_menu(callback: CallbackQuery):
     try:
-        file = await document.get_file()
-        file_content = await file.download_as_bytearray()
-    except Exception as e:
-        await update.message.reply_text(
-            "⚠ Failed to download file. Try a smaller file.",
-            reply_markup=combine_keyboard()
+        await callback.edit_message_text(MENU_TEXT, reply_markup=main_menu_keyboard())
+    except Exception:
+        pass
+
+# ───────────────────────────────────────────────────────────────────────────────
+# DOCUMENT HANDLER (dispatches by session state)
+# ───────────────────────────────────────────────────────────────────────────────
+
+@app.on_message(filters.document & filters.private)
+async def on_document(client: Client, message: Message):
+    if message.from_user is None:
+        return
+    user_id = message.from_user.id
+    register_user(message.from_user)
+    sess = get_session(user_id)
+    state = sess.get("state", STATE_IDLE)
+
+    doc = message.document
+    file_name = (doc.file_name or "file").lower()
+    file_size = doc.file_size or 0
+
+    if file_size > MAX_FILE_SIZE_BYTES:
+        await safe_send(client, message.chat.id,
+            f"⚠ File too large! Maximum size is 2 GB. (got {file_size / 1024**3:.2f} GB)")
+        return
+
+    if state == STATE_COMBINE:
+        await handle_combine_file(client, message, sess)
+    elif state == STATE_SPLIT and sess.get("split_file") is None:
+        await handle_split_file(client, message, sess)
+    elif state == STATE_CSVTOTXT:
+        await handle_csvtotxt_file(client, message, sess)
+    elif state == STATE_REMOVEDUPE:
+        await handle_removedupe_file(client, message, sess)
+    elif state == STATE_RENAME_FILE:
+        await handle_rename_file(client, message, sess)
+    else:
+        await safe_send(
+            client, message.chat.id,
+            "Use /start to access the menu and pick a feature first.",
+            reply_markup=back_keyboard(),
         )
-        return COMBINE_WAITING
-    
-    if "combine_files" not in context.user_data:
-        context.user_data["combine_files"] = []
-    
-    context.user_data["combine_files"].append({
-        "name": document.file_name,
-        "content": file_content.decode("utf-8", errors="ignore")
+
+# ───────────────────────────────────────────────────────────────────────────────
+# TEXT HANDLER (dispatches by session state)
+# ───────────────────────────────────────────────────────────────────────────────
+
+TEXT_EXCLUDE_CMDS = ["start", "help", "stats", "cancel"]
+
+@app.on_message(filters.text & filters.private & ~filters.command(TEXT_EXCLUDE_CMDS))
+async def on_text(client: Client, message: Message):
+    if message.from_user is None:
+        return
+    user_id = message.from_user.id
+    register_user(message.from_user)
+    sess = get_session(user_id)
+    state = sess.get("state", STATE_IDLE)
+
+    if state == STATE_SPLIT_VALUE:
+        await handle_split_value(client, message, sess)
+    elif state == STATE_MAKETXT:
+        await handle_maketxt_text(client, message, sess)
+    elif state == STATE_RENAME_NAME:
+        await handle_rename_name(client, message, sess)
+    # Other states: ignore plain text
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#                              COMBINER
+# ═══════════════════════════════════════════════════════════════════════════════
+
+async def handle_combine_file(client: Client, message: Message, sess: Dict):
+    doc = message.document
+    file_name = (doc.file_name or "file").lower()
+    if not (file_name.endswith(".txt") or file_name.endswith(".csv")):
+        await safe_send(
+            client, message.chat.id,
+            "⚠ Only TXT and CSV files are supported for COMBINER!",
+            reply_markup=combine_keyboard(),
+        )
+        return
+
+    content = await download_file_bytes(client, message)
+    if content is None:
+        await safe_send(
+            client, message.chat.id,
+            "⚠ Failed to download file. Try again.",
+            reply_markup=combine_keyboard(),
+        )
+        return
+
+    files = sess.setdefault("combine_files", [])
+    files.append({
+        "name": doc.file_name or "file",
+        "content": content.decode("utf-8", errors="ignore"),
     })
-    
-    count = len(context.user_data["combine_files"])
-    file_list = "\n".join([f"  {i+1}. {f['name'][:30]}" 
-                           for i, f in enumerate(context.user_data["combine_files"])])
-    
-    status_text = f"""
+    count = len(files)
+    file_list = "\n".join(f"  {i+1}. {f['name'][:30]}" for i, f in enumerate(files))
+    text = f"""
 {HEADER}
 
             COMBINER
@@ -838,17 +931,10 @@ async def handle_combine_file(update: Update, context: ContextTypes.DEFAULT_TYPE
 {DIVIDER}
    Send more files or click COMBINE
 {DIVIDER}"""
-    
-    # Send new status and store reference
-    status_msg = await update.message.reply_text(status_text, reply_markup=combine_keyboard())
-    context.user_data["combine_status_msg"] = status_msg
-    return COMBINE_WAITING
+    await safe_send(client, message.chat.id, text, reply_markup=combine_keyboard())
 
-async def do_combine_files(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Combine all uploaded files."""
-    query = update.callback_query
-    files = context.user_data.get("combine_files", [])
-    
+async def do_combine_files(client: Client, callback: CallbackQuery, sess: Dict, user_id: int):
+    files = sess.get("combine_files", [])
     processing_text = f"""
 {HEADER}
 
@@ -861,37 +947,29 @@ async def do_combine_files(update: Update, context: ContextTypes.DEFAULT_TYPE) -
    Combining {len(files)} files...
 
 {DIVIDER}"""
-    
-    await query.edit_message_text(processing_text)
-    
-    # Combine files and remove duplicates
-    all_lines = []
+    try:
+        await callback.edit_message_text(processing_text)
+    except Exception:
+        pass
+
+    all_lines: List[str] = []
     for f in files:
-        content = f["content"]
-        lines = content.splitlines()
-        all_lines.extend(lines)
-    
-    # Remove duplicates while preserving order
+        all_lines.extend(f["content"].splitlines())
+
     seen = set()
     unique_lines = []
     for line in all_lines:
         if line not in seen:
             seen.add(line)
             unique_lines.append(line)
-    
-    combined_content = "\n".join(unique_lines)
-    if combined_content and not combined_content.endswith("\n"):
-        combined_content += "\n"
-    
-    # Create temporary file
-    with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False, encoding='utf-8') as tmp:
-        tmp.write(combined_content)
-        tmp_path = tmp.name
-    
-    # Send file
+
+    combined = "\n".join(unique_lines)
+    if combined and not combined.endswith("\n"):
+        combined += "\n"
+
     total_lines = len(unique_lines)
-    dupes_removed = len(all_lines) - len(unique_lines)
-    
+    dupes_removed = len(all_lines) - total_lines
+
     result_text = f"""
 {HEADER}
 
@@ -905,74 +983,62 @@ async def do_combine_files(update: Update, context: ContextTypes.DEFAULT_TYPE) -
   ► Output format: TXT
 
 {DIVIDER}"""
-    
-    await query.edit_message_text(result_text, reply_markup=back_keyboard())
-    
-    with open(tmp_path, 'rb') as f:
-        await query.message.reply_document(
-            document=f,
-            filename="combined_output.txt",
-            caption="► Combined file ready!"
-        )
-    
-    # Cleanup
-    os.unlink(tmp_path)
-    context.user_data.clear()
-
-async def handle_split_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Handle file upload for splitting."""
-    document = update.message.document
-    
-    if not document:
-        await update.message.reply_text("Please send a valid file.")
-        return SPLIT_WAITING
-    
-    file_name = document.file_name.lower()
-    if not (file_name.endswith('.txt') or file_name.endswith('.csv')):
-        keyboard = [[InlineKeyboardButton("◄ CANCEL", callback_data="cancel_split")]]
-        await update.message.reply_text(
-            "⚠ Only TXT and CSV files are supported!",
-            reply_markup=InlineKeyboardMarkup(keyboard)
-        )
-        return SPLIT_WAITING
-    
-    # Check file size (Telegram bot API limit is 20MB)
-    if document.file_size > 20 * 1024 * 1024:
-        keyboard = [[InlineKeyboardButton("◄ CANCEL", callback_data="cancel_split")]]
-        await update.message.reply_text(
-            "⚠ File too large! Maximum size is 20MB.",
-            reply_markup=InlineKeyboardMarkup(keyboard)
-        )
-        return SPLIT_WAITING
-    
-    # Download file
     try:
-        file = await document.get_file()
-        file_content = await file.download_as_bytearray()
-    except Exception as e:
-        keyboard = [[InlineKeyboardButton("◄ CANCEL", callback_data="cancel_split")]]
-        await update.message.reply_text(
-            "⚠ Failed to download file. Try a smaller file.",
-            reply_markup=InlineKeyboardMarkup(keyboard)
+        await callback.edit_message_text(result_text, reply_markup=back_keyboard())
+    except Exception:
+        pass
+
+    await send_document_bytes(
+        client, callback.message.chat.id,
+        combined.encode("utf-8"),
+        "combined_output.txt",
+        "► Combined file ready!",
+    )
+    reset_session(user_id)
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#                              SPLITTER
+# ═══════════════════════════════════════════════════════════════════════════════
+
+async def handle_split_file(client: Client, message: Message, sess: Dict):
+    doc = message.document
+    file_name = (doc.file_name or "file").lower()
+    if not (file_name.endswith(".txt") or file_name.endswith(".csv")):
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("◄ CANCEL", callback_data="cancel_split")]])
+        await safe_send(
+            client, message.chat.id,
+            "⚠ Only TXT and CSV files are supported for SPLITTER!",
+            reply_markup=kb,
         )
-        return SPLIT_WAITING
-    
-    context.user_data["split_file"] = {
-        "name": document.file_name,
-        "content": file_content.decode("utf-8", errors="ignore")
+        return
+
+    content = await download_file_bytes(client, message)
+    if content is None:
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("◄ CANCEL", callback_data="cancel_split")]])
+        await safe_send(
+            client, message.chat.id,
+            "⚠ Failed to download file. Try again.",
+            reply_markup=kb,
+        )
+        return
+
+    sess["split_file"] = {
+        "name": doc.file_name or "file",
+        "content": content.decode("utf-8", errors="ignore"),
+        "raw_size": len(content),
     }
-    
-    lines = context.user_data["split_file"]["content"].count('\n') + 1
-    size_kb = len(file_content) / 1024
-    
-    split_text = f"""
+
+    lines = sess["split_file"]["content"].count("\n") + 1
+    size_kb = sess["split_file"]["raw_size"] / 1024
+
+    text = f"""
 {HEADER}
 
             SPLITTER
 
 {DIVIDER}
 
-  ► File: {document.file_name[:28]}
+  ► File: {sess['split_file']['name'][:28]}
   ► Size: {size_kb:.1f} KB
   ► Lines: {lines}
 
@@ -981,30 +1047,31 @@ async def handle_split_file(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 {DIVIDER}
        Select method below
 {DIVIDER}"""
-    
-    await update.message.reply_text(split_text, reply_markup=split_method_keyboard())
-    return SPLIT_METHOD
+    await safe_send(client, message.chat.id, text, reply_markup=split_method_keyboard())
+    sess["state"] = STATE_SPLIT_METHOD
 
-async def handle_split_value(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Handle split value input."""
+async def handle_split_value(client: Client, message: Message, sess: Dict):
+    raw = (message.text or "").strip()
     try:
-        value = int(update.message.text.strip())
+        value = int(raw)
         if value <= 0:
-            raise ValueError("Value must be positive")
+            raise ValueError
     except ValueError:
-        await update.message.reply_text("⚠ Please enter a valid positive number!")
-        return SPLIT_VALUE
-    
-    method = context.user_data.get("split_method")
-    file_data = context.user_data.get("split_file")
-    
+        await safe_send(client, message.chat.id, "⚠ Please enter a valid positive number!")
+        return
+
+    method = sess.get("split_method")
+    file_data = sess.get("split_file")
     if not file_data:
-        await update.message.reply_text("⚠ No file found. Please start over.", reply_markup=back_keyboard())
-        return ConversationHandler.END
-    
+        await safe_send(
+            client, message.chat.id,
+            "⚠ No file found. Please start over.",
+            reply_markup=back_keyboard(),
+        )
+        reset_session(message.from_user.id)
+        return
+
     content = file_data["content"]
-    
-    # Remove duplicates while preserving order
     raw_lines = content.splitlines()
     seen = set()
     unique_lines = []
@@ -1012,10 +1079,9 @@ async def handle_split_value(update: Update, context: ContextTypes.DEFAULT_TYPE)
         if line not in seen:
             seen.add(line)
             unique_lines.append(line)
-    
     dupes_removed = len(raw_lines) - len(unique_lines)
     lines = [line + "\n" for line in unique_lines]
-    
+
     processing_text = f"""
 {HEADER}
 
@@ -1028,53 +1094,45 @@ async def handle_split_value(update: Update, context: ContextTypes.DEFAULT_TYPE)
     Splitting file...
 
 {DIVIDER}"""
-    
-    status_msg = await update.message.reply_text(processing_text)
-    
-    # Split logic
+    status_msg = await safe_send(client, message.chat.id, processing_text)
+
     chunks = []
-    
     if method == "lines":
-        # Split by max lines per file
         for i in range(0, len(lines), value):
-            chunk = lines[i:i + value]
-            chunks.append("".join(chunk))
-    
+            chunks.append("".join(lines[i:i + value]))
     elif method == "count":
-        # Split into N files
         if value > len(lines):
             value = len(lines)
-        chunk_size = len(lines) // value
-        remainder = len(lines) % value
-        
-        start = 0
-        for i in range(value):
-            extra = 1 if i < remainder else 0
-            end = start + chunk_size + extra
-            chunk = lines[start:end]
-            if chunk:
-                chunks.append("".join(chunk))
-            start = end
-    
+        if value <= 0:
+            chunks = ["".join(lines)] if lines else []
+        else:
+            chunk_size = len(lines) // value
+            remainder = len(lines) % value
+            start = 0
+            for i in range(value):
+                extra = 1 if i < remainder else 0
+                end = start + chunk_size + extra
+                chunk = lines[start:end]
+                if chunk:
+                    chunks.append("".join(chunk))
+                start = end
     elif method == "size":
-        # Split by max size in KB
         max_bytes = value * 1024
-        current_chunk = ""
-        
+        current = ""
         for line in lines:
-            if len((current_chunk + line).encode('utf-8')) > max_bytes and current_chunk:
-                chunks.append(current_chunk)
-                current_chunk = line
+            if current and len((current + line).encode("utf-8")) > max_bytes:
+                chunks.append(current)
+                current = line
             else:
-                current_chunk += line
-        
-        if current_chunk:
-            chunks.append(current_chunk)
-    
+                current += line
+        if current:
+            chunks.append(current)
+    else:
+        chunks = [content]
+
     if not chunks:
         chunks = [content]
-    
-    # Send files
+
     result_text = f"""
 {HEADER}
 
@@ -1087,49 +1145,43 @@ async def handle_split_value(update: Update, context: ContextTypes.DEFAULT_TYPE)
   ► Output format: TXT
 
 {DIVIDER}"""
-    
-    await status_msg.edit_text(result_text, reply_markup=back_keyboard())
-    
-    base_name = os.path.splitext(file_data["name"])[0]
-    
-    for i, chunk in enumerate(chunks, 1):
-        with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False, encoding='utf-8') as tmp:
-            tmp.write(chunk)
-            tmp_path = tmp.name
-        
-        with open(tmp_path, 'rb') as f:
-            await update.message.reply_document(
-                document=f,
-                filename=f"{base_name}_part{i:03d}.txt",
-                caption=f"► Part {i} of {len(chunks)}"
-            )
-        
-        os.unlink(tmp_path)
-        await asyncio.sleep(0.3)  # Prevent rate limiting
-    
-    context.user_data.clear()
-    return ConversationHandler.END
+    if status_msg:
+        try:
+            await status_msg.edit_text(result_text, reply_markup=back_keyboard())
+        except Exception:
+            pass
+    else:
+        await safe_send(client, message.chat.id, result_text, reply_markup=back_keyboard())
 
-async def handle_maketxt_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Handle text message for Make TXT."""
-    text = update.message.text.strip()
-    
+    base_name = os.path.splitext(file_data["name"])[0]
+    for i, chunk in enumerate(chunks, 1):
+        ext = os.path.splitext(file_data["name"])[1] or ".txt"
+        fname = f"{base_name}_part{i:03d}{ext}"
+        await send_document_bytes(
+            client, message.chat.id,
+            chunk.encode("utf-8"),
+            fname,
+            f"► Part {i} of {len(chunks)}",
+        )
+        await asyncio.sleep(0.3)
+
+    reset_session(message.from_user.id)
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#                              MAKE TXT
+# ═══════════════════════════════════════════════════════════════════════════════
+
+async def handle_maketxt_text(client: Client, message: Message, sess: Dict):
+    text = (message.text or "").strip()
     if not text:
-        await update.message.reply_text("Please send some text.")
-        return MAKETXT_WAITING
-    
-    if "maketxt_lines" not in context.user_data:
-        context.user_data["maketxt_lines"] = []
-    
-    # Add each line from the message
-    new_lines = text.splitlines()
-    context.user_data["maketxt_lines"].extend(new_lines)
-    
-    count = len(context.user_data["maketxt_lines"])
-    preview_lines = context.user_data["maketxt_lines"][-5:]  # Show last 5 lines
-    preview = "\n".join([f"  {line[:34]}" for line in preview_lines])
-    
-    status_text = f"""
+        await safe_send(client, message.chat.id, "Please send some text.")
+        return
+
+    lines = sess.setdefault("maketxt_lines", [])
+    lines.extend(text.splitlines())
+    count = len(lines)
+    preview = "\n".join(f"  {line[:34]}" for line in lines[-5:])
+    body = f"""
 {HEADER}
 
             MAKE TXT
@@ -1142,15 +1194,10 @@ async def handle_maketxt_text(update: Update, context: ContextTypes.DEFAULT_TYPE
 {DIVIDER}
    Send more or click CREATE TXT
 {DIVIDER}"""
-    
-    await update.message.reply_text(status_text, reply_markup=maketxt_keyboard())
-    return MAKETXT_WAITING
+    await safe_send(client, message.chat.id, body, reply_markup=maketxt_keyboard())
 
-async def do_maketxt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Create TXT file from collected lines."""
-    query = update.callback_query
-    lines = context.user_data.get("maketxt_lines", [])
-    
+async def do_maketxt(client: Client, callback: CallbackQuery, sess: Dict, user_id: int):
+    lines = sess.get("maketxt_lines", [])
     processing_text = f"""
 {HEADER}
 
@@ -1163,27 +1210,23 @@ async def do_maketxt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     Creating TXT file...
 
 {DIVIDER}"""
-    
-    await query.edit_message_text(processing_text)
-    
-    # Remove duplicates while preserving order
+    try:
+        await callback.edit_message_text(processing_text)
+    except Exception:
+        pass
+
     seen = set()
     unique_lines = []
     for line in lines:
         if line not in seen:
             seen.add(line)
             unique_lines.append(line)
-    
     dupes_removed = len(lines) - len(unique_lines)
+
     content = "\n".join(unique_lines)
     if content and not content.endswith("\n"):
         content += "\n"
-    
-    # Create temporary file
-    with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False, encoding='utf-8') as tmp:
-        tmp.write(content)
-        tmp_path = tmp.name
-    
+
     result_text = f"""
 {HEADER}
 
@@ -1196,59 +1239,46 @@ async def do_maketxt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
   ► Output format: TXT
 
 {DIVIDER}"""
-    
-    await query.edit_message_text(result_text, reply_markup=back_keyboard())
-    
-    with open(tmp_path, 'rb') as f:
-        await query.message.reply_document(
-            document=f,
-            filename="output.txt",
-            caption="► TXT file ready!"
-        )
-    
-    # Cleanup
-    os.unlink(tmp_path)
-    context.user_data.clear()
-
-async def handle_csvtotxt_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Handle CSV file upload for conversion to TXT."""
-    document = update.message.document
-    
-    if not document:
-        await update.message.reply_text("Please send a valid file.")
-        return CSVTOTXT_WAITING
-    
-    file_name = document.file_name.lower()
-    if not file_name.endswith('.csv'):
-        keyboard = [[InlineKeyboardButton("◄ CANCEL", callback_data="cancel_csvtotxt")]]
-        await update.message.reply_text(
-            "⚠ Only CSV files are supported!",
-            reply_markup=InlineKeyboardMarkup(keyboard)
-        )
-        return CSVTOTXT_WAITING
-    
-    # Check file size (Telegram bot API limit is 20MB)
-    if document.file_size > 20 * 1024 * 1024:
-        keyboard = [[InlineKeyboardButton("◄ CANCEL", callback_data="cancel_csvtotxt")]]
-        await update.message.reply_text(
-            "⚠ File too large! Maximum size is 20MB.",
-            reply_markup=InlineKeyboardMarkup(keyboard)
-        )
-        return CSVTOTXT_WAITING
-    
-    # Download file
     try:
-        file = await document.get_file()
-        file_content = await file.download_as_bytearray()
-    except Exception as e:
-        keyboard = [[InlineKeyboardButton("◄ CANCEL", callback_data="cancel_csvtotxt")]]
-        await update.message.reply_text(
-            "⚠ Failed to download file. Try a smaller file.",
-            reply_markup=InlineKeyboardMarkup(keyboard)
+        await callback.edit_message_text(result_text, reply_markup=back_keyboard())
+    except Exception:
+        pass
+
+    await send_document_bytes(
+        client, callback.message.chat.id,
+        content.encode("utf-8"),
+        "output.txt",
+        "► TXT file ready!",
+    )
+    reset_session(user_id)
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#                              CSV → TXT
+# ═══════════════════════════════════════════════════════════════════════════════
+
+async def handle_csvtotxt_file(client: Client, message: Message, sess: Dict):
+    doc = message.document
+    file_name = (doc.file_name or "file").lower()
+    if not file_name.endswith(".csv"):
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("◄ CANCEL", callback_data="cancel_csvtotxt")]])
+        await safe_send(
+            client, message.chat.id,
+            "⚠ Only CSV files are supported!",
+            reply_markup=kb,
         )
-        return CSVTOTXT_WAITING
-    content = file_content.decode("utf-8", errors="ignore")
-    
+        return
+
+    content = await download_file_bytes(client, message)
+    if content is None:
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("◄ CANCEL", callback_data="cancel_csvtotxt")]])
+        await safe_send(
+            client, message.chat.id,
+            "⚠ Failed to download file. Try again.",
+            reply_markup=kb,
+        )
+        return
+
+    text_decoded = content.decode("utf-8", errors="ignore")
     processing_text = f"""
 {HEADER}
 
@@ -1261,30 +1291,22 @@ async def handle_csvtotxt_file(update: Update, context: ContextTypes.DEFAULT_TYP
    Converting CSV to TXT...
 
 {DIVIDER}"""
-    
-    status_msg = await update.message.reply_text(processing_text)
-    
-    # Remove duplicates while preserving order
-    raw_lines = content.splitlines()
+    status_msg = await safe_send(client, message.chat.id, processing_text)
+
+    raw_lines = text_decoded.splitlines()
     seen = set()
     unique_lines = []
     for line in raw_lines:
         if line not in seen:
             seen.add(line)
             unique_lines.append(line)
-    
     dupes_removed = len(raw_lines) - len(unique_lines)
-    output_content = "\n".join(unique_lines)
-    if output_content and not output_content.endswith("\n"):
-        output_content += "\n"
-    
-    # Create temporary file
-    with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False, encoding='utf-8') as tmp:
-        tmp.write(output_content)
-        tmp_path = tmp.name
-    
-    base_name = os.path.splitext(document.file_name)[0]
-    
+
+    out = "\n".join(unique_lines)
+    if out and not out.endswith("\n"):
+        out += "\n"
+
+    base_name = os.path.splitext(doc.file_name or "file")[0]
     result_text = f"""
 {HEADER}
 
@@ -1297,60 +1319,44 @@ async def handle_csvtotxt_file(update: Update, context: ContextTypes.DEFAULT_TYP
   ► Output format: TXT
 
 {DIVIDER}"""
-    
-    await status_msg.edit_text(result_text, reply_markup=back_keyboard())
-    
-    with open(tmp_path, 'rb') as f:
-        await update.message.reply_document(
-            document=f,
-            filename=f"{base_name}.txt",
-            caption="► TXT file ready!"
-        )
-    
-    # Cleanup
-    os.unlink(tmp_path)
-    context.user_data.clear()
-    return ConversationHandler.END
+    if status_msg:
+        try:
+            await status_msg.edit_text(result_text, reply_markup=back_keyboard())
+        except Exception:
+            pass
+
+    await send_document_bytes(
+        client, message.chat.id,
+        out.encode("utf-8"),
+        f"{base_name}.txt",
+        "► TXT file ready!",
+    )
+    reset_session(message.from_user.id)
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #                              REMOVE COMMON LINES
 # ═══════════════════════════════════════════════════════════════════════════════
 
-async def handle_removedupe_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Handle file uploads for remove-common-lines feature."""
-    document = update.message.document
-    if not document:
-        await update.message.reply_text("Please send a valid file.")
-        return REMOVEDUPE_WAITING_FILE1 if len(context.user_data.get("removedupe_files", [])) == 0 else REMOVEDUPE_WAITING_FILE2
-    
-    # Accept any text-based file: skip files that look binary by checking size sanity
-    if document.file_size > 20 * 1024 * 1024:
-        await update.message.reply_text(
-            "⚠ File too large! Maximum size is 20MB.",
-            reply_markup=removedupe_keyboard()
+async def handle_removedupe_file(client: Client, message: Message, sess: Dict):
+    doc = message.document
+    content = await download_file_bytes(client, message)
+    if content is None:
+        await safe_send(
+            client, message.chat.id,
+            "⚠ Failed to download file. Try again.",
+            reply_markup=removedupe_keyboard(),
         )
-        return REMOVEDUPE_WAITING_FILE1 if len(context.user_data.get("removedupe_files", [])) == 0 else REMOVEDUPE_WAITING_FILE2
-    
-    try:
-        file = await document.get_file()
-        file_content = await file.download_as_bytearray()
-    except Exception:
-        await update.message.reply_text(
-            "⚠ Failed to download file. Try a smaller file.",
-            reply_markup=removedupe_keyboard()
-        )
-        return REMOVEDUPE_WAITING_FILE1 if len(context.user_data.get("removedupe_files", [])) == 0 else REMOVEDUPE_WAITING_FILE2
-    
-    files = context.user_data.get("removedupe_files", [])
+        return
+
+    files = sess.setdefault("removedupe_files", [])
     files.append({
-        "name": document.file_name,
-        "content": file_content.decode("utf-8", errors="ignore")
+        "name": doc.file_name or "file",
+        "content": content.decode("utf-8", errors="ignore"),
     })
-    context.user_data["removedupe_files"] = files
-    
+
     count = len(files)
-    file_list = "\n".join([f"  {i+1}. {f['name'][:30]}" for i, f in enumerate(files)])
-    
+    file_list = "\n".join(f"  {i+1}. {f['name'][:30]}" for i, f in enumerate(files))
+
     if count < 2:
         text = f"""
 {HEADER}
@@ -1366,22 +1372,26 @@ async def handle_removedupe_file(update: Update, context: ContextTypes.DEFAULT_T
 {DIVIDER}
     Send file 2 below to proceed
 {DIVIDER}"""
-        await update.message.reply_text(text, reply_markup=removedupe_keyboard())
-        return REMOVEDUPE_WAITING_FILE2
-    
-    # Two files collected -> process
-    await do_removedupe(update, context)
-    return ConversationHandler.END
-
-async def do_removedupe(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Process two files: remove lines common to both; send two output files."""
-    files = context.user_data.get("removedupe_files", [])
-    if len(files) < 2:
-        await update.message.reply_text("⚠ Need exactly 2 files to process.", reply_markup=back_keyboard())
-        context.user_data.clear()
+        await safe_send(client, message.chat.id, text, reply_markup=removedupe_keyboard())
         return
-    
-    status_msg = await update.message.reply_text(f"""
+
+    # Two files collected -> process
+    await do_removedupe(client, message, sess, message.from_user.id)
+
+async def do_removedupe(client: Client, message: Message, sess: Dict, user_id: int):
+    files = sess.get("removedupe_files", [])
+    if len(files) < 2:
+        await safe_send(
+            client, message.chat.id,
+            "⚠ Need exactly 2 files to process.",
+            reply_markup=back_keyboard(),
+        )
+        reset_session(user_id)
+        return
+
+    status_msg = await safe_send(
+        client, message.chat.id,
+        f"""
 {HEADER}
 
           PROCESSING
@@ -1392,38 +1402,31 @@ async def do_removedupe(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
    Removing common lines...
 
-{DIVIDER}""")
-    
+{DIVIDER}""",
+    )
+
     lines1 = files[0]["content"].splitlines()
     lines2 = files[1]["content"].splitlines()
-    
-    trimmed_set1 = {line.strip() for line in lines1}
-    trimmed_set2 = {line.strip() for line in lines2}
-    common = trimmed_set1 & trimmed_set2
-    
-    out1 = [line for line in lines1 if line.strip() not in common]
-    out2 = [line for line in lines2 if line.strip() not in common]
-    
-    out1_content = "\n".join(out1)
-    if out1_content and not out1_content.endswith("\n"):
-        out1_content += "\n"
-    out2_content = "\n".join(out2)
-    if out2_content and not out2_content.endswith("\n"):
-        out2_content += "\n"
-    
+
+    trimmed1 = {ln.strip() for ln in lines1}
+    trimmed2 = {ln.strip() for ln in lines2}
+    common = trimmed1 & trimmed2
+
+    out1 = [ln for ln in lines1 if ln.strip() not in common]
+    out2 = [ln for ln in lines2 if ln.strip() not in common]
+
+    out1_text = "\n".join(out1)
+    if out1_text and not out1_text.endswith("\n"):
+        out1_text += "\n"
+    out2_text = "\n".join(out2)
+    if out2_text and not out2_text.endswith("\n"):
+        out2_text += "\n"
+
     common_count = len(common)
-    
-    # Send file 1 result
+
     base1 = os.path.splitext(files[0]["name"])[0]
     base2 = os.path.splitext(files[1]["name"])[0]
-    
-    with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False, encoding='utf-8') as tmp:
-        tmp.write(out1_content)
-        tmp_path1 = tmp.name
-    with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False, encoding='utf-8') as tmp:
-        tmp.write(out2_content)
-        tmp_path2 = tmp.name
-    
+
     result_text = f"""
 {HEADER}
 
@@ -1438,65 +1441,52 @@ async def do_removedupe(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
   ► Output: 2 TXT files
 
 {DIVIDER}"""
-    
-    await status_msg.edit_text(result_text, reply_markup=back_keyboard())
-    
-    with open(tmp_path1, 'rb') as f:
-        await update.message.reply_document(
-            document=f,
-            filename=f"{base1}_unique.txt",
-            caption=f"► File 1 (common removed)"
-        )
-    os.unlink(tmp_path1)
+    if status_msg:
+        try:
+            await status_msg.edit_text(result_text, reply_markup=back_keyboard())
+        except Exception:
+            pass
+    else:
+        await safe_send(client, message.chat.id, result_text, reply_markup=back_keyboard())
+
+    await send_document_bytes(
+        client, message.chat.id,
+        out1_text.encode("utf-8"),
+        f"{base1}_unique.txt",
+        "► File 1 (common removed)",
+    )
     await asyncio.sleep(0.3)
-    
-    with open(tmp_path2, 'rb') as f:
-        await update.message.reply_document(
-            document=f,
-            filename=f"{base2}_unique.txt",
-            caption=f"► File 2 (common removed)"
-        )
-    os.unlink(tmp_path2)
-    
-    context.user_data.clear()
+    await send_document_bytes(
+        client, message.chat.id,
+        out2_text.encode("utf-8"),
+        f"{base2}_unique.txt",
+        "► File 2 (common removed)",
+    )
+    reset_session(user_id)
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #                              RENAME
 # ═══════════════════════════════════════════════════════════════════════════════
 
-async def handle_rename_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Handle file upload for rename feature (any file type)."""
-    document = update.message.document
-    if not document:
-        await update.message.reply_text("Please send a valid file.")
-        return RENAME_WAITING_FILE
-    
-    if document.file_size > 20 * 1024 * 1024:
-        keyboard = [[InlineKeyboardButton("◄ CANCEL", callback_data="cancel_rename")]]
-        await update.message.reply_text(
-            "⚠ File too large! Maximum size is 20MB.",
-            reply_markup=InlineKeyboardMarkup(keyboard)
+async def handle_rename_file(client: Client, message: Message, sess: Dict):
+    doc = message.document
+    content = await download_file_bytes(client, message)
+    if content is None:
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("◄ CANCEL", callback_data="cancel_rename")]])
+        await safe_send(
+            client, message.chat.id,
+            "⚠ Failed to download file. Try again.",
+            reply_markup=kb,
         )
-        return RENAME_WAITING_FILE
-    
-    try:
-        file = await document.get_file()
-        file_content = await file.download_as_bytearray()
-    except Exception:
-        keyboard = [[InlineKeyboardButton("◄ CANCEL", callback_data="cancel_rename")]]
-        await update.message.reply_text(
-            "⚠ Failed to download file. Try a smaller file.",
-            reply_markup=InlineKeyboardMarkup(keyboard)
-        )
-        return RENAME_WAITING_FILE
-    
-    size_kb = len(file_content) / 1024
-    context.user_data["rename_file"] = {
-        "name": document.file_name or "file",
-        "content": bytes(file_content),
-        "size": len(file_content)
+        return
+
+    size_kb = len(content) / 1024
+    sess["rename_file"] = {
+        "name": doc.file_name or "file",
+        "content": content,
+        "size": len(content),
     }
-    
+
     text = f"""
 {HEADER}
 
@@ -1504,7 +1494,7 @@ async def handle_rename_file(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 {DIVIDER}
 
-  ► File: {document.file_name[:30] if document.file_name else 'file'}
+  ► File: {(doc.file_name or 'file')[:30]}
   ► Size: {size_kb:.1f} KB
 
   Now type the NEW full filename
@@ -1514,37 +1504,40 @@ async def handle_rename_file(update: Update, context: ContextTypes.DEFAULT_TYPE)
   ► No validation enforced
   ► No extension auto-appended
   ► Use EXACTLY what you type
+  ► Original file content unchanged
 
 {DIVIDER}
        Type the new name below
 {DIVIDER}"""
-    
-    keyboard = [[InlineKeyboardButton("◄ CANCEL", callback_data="cancel_rename")]]
-    await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
-    return RENAME_WAITING_NAME
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("◄ CANCEL", callback_data="cancel_rename")]])
+    await safe_send(client, message.chat.id, text, reply_markup=kb)
+    sess["state"] = STATE_RENAME_NAME
 
-async def handle_rename_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Handle the new filename input and send renamed file back."""
-    new_name = update.message.text.strip()
-    
-    file_data = context.user_data.get("rename_file")
+async def handle_rename_name(client: Client, message: Message, sess: Dict):
+    new_name = (message.text or "").strip()
+    file_data = sess.get("rename_file")
     if not file_data:
-        keyboard = [[InlineKeyboardButton("◄ BACK TO MENU", callback_data="menu")]]
-        await update.message.reply_text(
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("◄ BACK TO MENU", callback_data="menu")]])
+        await safe_send(
+            client, message.chat.id,
             "⚠ No file to rename. Please start over with /start.",
-            reply_markup=InlineKeyboardMarkup(keyboard)
+            reply_markup=kb,
         )
-        return ConversationHandler.END
-    
+        reset_session(message.from_user.id)
+        return
+
     if not new_name:
-        keyboard = [[InlineKeyboardButton("◄ CANCEL", callback_data="cancel_rename")]]
-        await update.message.reply_text(
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("◄ CANCEL", callback_data="cancel_rename")]])
+        await safe_send(
+            client, message.chat.id,
             "⚠ Filename cannot be empty. Type a new filename below.",
-            reply_markup=InlineKeyboardMarkup(keyboard)
+            reply_markup=kb,
         )
-        return RENAME_WAITING_NAME
-    
-    status_msg = await update.message.reply_text(f"""
+        return
+
+    status_msg = await safe_send(
+        client, message.chat.id,
+        f"""
 {HEADER}
 
           PROCESSING
@@ -1555,13 +1548,9 @@ async def handle_rename_name(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
    Renaming file...
 
-{DIVIDER}""")
-    
-    ext = os.path.splitext(new_name)[1]
-    with tempfile.NamedTemporaryFile(mode='wb', suffix=ext, delete=False) as tmp:
-        tmp.write(file_data["content"])
-        tmp_path = tmp.name
-    
+{DIVIDER}""",
+    )
+
     result_text = f"""
 {HEADER}
 
@@ -1574,127 +1563,32 @@ async def handle_rename_name(update: Update, context: ContextTypes.DEFAULT_TYPE)
   ► Size: {file_data['size']/1024:.1f} KB
 
 {DIVIDER}"""
-    
-    await status_msg.edit_text(result_text, reply_markup=back_keyboard())
-    
-    with open(tmp_path, 'rb') as f:
-        await update.message.reply_document(
-            document=f,
-            filename=new_name,
-            caption=f"► Renamed: {file_data['name']} → {new_name}"
-        )
-    os.unlink(tmp_path)
-    
-    context.user_data.clear()
-    return ConversationHandler.END
+    if status_msg:
+        try:
+            await status_msg.edit_text(result_text, reply_markup=back_keyboard())
+        except Exception:
+            pass
+    else:
+        await safe_send(client, message.chat.id, result_text, reply_markup=back_keyboard())
 
-# ═══════════════════════════════════════════════════════════════════════════════
-#                              FALLBACK HANDLERS
-# ═══════════════════════════════════════════════════════════════════════════════
-
-async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Cancel current operation."""
-    context.user_data.clear()
-    await update.message.reply_text(
-        "Operation cancelled. Use /start to begin again.",
-        reply_markup=back_keyboard()
+    await send_document_bytes(
+        client, message.chat.id,
+        file_data["content"],
+        new_name,
+        f"► Renamed: {file_data['name']} → {new_name}",
     )
-    return ConversationHandler.END
-
-async def unknown_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle unexpected files."""
-    register_user(update.effective_user)
-    await update.message.reply_text(
-        "Use /start to access the menu and select COMBINER or SPLITTER first.",
-        reply_markup=back_keyboard()
-    )
+    reset_session(message.from_user.id)
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#                              MAIN APPLICATION
+#                              MAIN
 # ═══════════════════════════════════════════════════════════════════════════════
-
-async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle errors gracefully."""
-    logger.error(f"Exception: {context.error}")
-    
-    if update and update.effective_message:
-        await update.effective_message.reply_text(
-            "⚠ An error occurred. Please try again or use /start to restart.",
-            reply_markup=back_keyboard()
-        )
 
 def main() -> None:
-    """Run the bot."""
-    application = Application.builder().token(BOT_TOKEN).build()
-    
-    # Conversation handler for file operations
-    conv_handler = ConversationHandler(
-        entry_points=[
-            CommandHandler("start", start_command),
-            CallbackQueryHandler(button_callback),
-        ],
-        states={
-            COMBINE_WAITING: [
-                MessageHandler(filters.Document.ALL, handle_combine_file),
-                CallbackQueryHandler(button_callback),
-            ],
-            SPLIT_WAITING: [
-                MessageHandler(filters.Document.ALL, handle_split_file),
-                CallbackQueryHandler(button_callback),
-            ],
-            SPLIT_METHOD: [
-                CallbackQueryHandler(button_callback),
-            ],
-            SPLIT_VALUE: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_split_value),
-                CallbackQueryHandler(button_callback),
-            ],
-            MAKETXT_WAITING: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_maketxt_text),
-                CallbackQueryHandler(button_callback),
-            ],
-            CSVTOTXT_WAITING: [
-                MessageHandler(filters.Document.ALL, handle_csvtotxt_file),
-                CallbackQueryHandler(button_callback),
-            ],
-            REMOVEDUPE_WAITING_FILE1: [
-                MessageHandler(filters.Document.ALL, handle_removedupe_file),
-                CallbackQueryHandler(button_callback),
-            ],
-            REMOVEDUPE_WAITING_FILE2: [
-                MessageHandler(filters.Document.ALL, handle_removedupe_file),
-                CallbackQueryHandler(button_callback),
-            ],
-            RENAME_WAITING_FILE: [
-                MessageHandler(filters.Document.ALL, handle_rename_file),
-                CallbackQueryHandler(button_callback),
-            ],
-            RENAME_WAITING_NAME: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_rename_name),
-                CallbackQueryHandler(button_callback),
-            ],
-        },
-        fallbacks=[
-            CommandHandler("start", start_command),
-            CommandHandler("cancel", cancel),
-            CallbackQueryHandler(button_callback),
-        ],
-        per_user=True,
-        per_chat=True,
-        per_message=False,
-    )
-    
-    application.add_handler(conv_handler)
-    application.add_handler(CommandHandler("help", help_command))
-    application.add_handler(CommandHandler("stats", stats_command))
-    application.add_handler(MessageHandler(filters.Document.ALL, unknown_file))
-    application.add_error_handler(error_handler)
-    
-    # Start polling
     print("═" * 50)
-    print("  FILE TOOLKIT BOT - RUNNING")
+    print("  FILE TOOLKIT BOT - RUNNING (Pyrogram MTProto)")
+    print(f"  Max file size: 2 GB")
     print("═" * 50)
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
+    app.run()
 
 if __name__ == "__main__":
     main()
