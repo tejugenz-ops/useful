@@ -30,6 +30,10 @@ SPLIT_METHOD = 3
 SPLIT_VALUE = 4
 MAKETXT_WAITING = 5
 CSVTOTXT_WAITING = 6
+REMOVEDUPE_WAITING_FILE1 = 7
+REMOVEDUPE_WAITING_FILE2 = 8
+RENAME_WAITING_FILE = 9
+RENAME_WAITING_NAME = 10
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #                              LOGGING SETUP
@@ -96,6 +100,10 @@ def main_menu_keyboard() -> InlineKeyboardMarkup:
             InlineKeyboardButton("◈ CSV→TXT ◈", callback_data="csvtotxt"),
         ],
         [
+            InlineKeyboardButton("◈ RM COMMON ◈", callback_data="removedupe"),
+            InlineKeyboardButton("◈ RENAME ◈", callback_data="rename"),
+        ],
+        [
             InlineKeyboardButton("▣ STATS", callback_data="stats"),
             InlineKeyboardButton("▣ HELP", callback_data="help"),
         ],
@@ -140,6 +148,14 @@ def maketxt_keyboard() -> InlineKeyboardMarkup:
     ]
     return InlineKeyboardMarkup(keyboard)
 
+def removedupe_keyboard() -> InlineKeyboardMarkup:
+    """Create remove-common action keyboard."""
+    keyboard = [
+        [InlineKeyboardButton("✕ CLEAR FILES", callback_data="clear_removedupe")],
+        [InlineKeyboardButton("◄ CANCEL", callback_data="cancel_removedupe")],
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
 # ═══════════════════════════════════════════════════════════════════════════════
 #                              COMMAND HANDLERS
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -169,6 +185,14 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
 
   ◈ CSV→TXT
     Convert CSV file to TXT
+
+  ◈ RM COMMON
+    Remove lines common to
+    2 files; returns 2 files
+
+  ◈ RENAME
+    Rename any file with full
+    new name (incl. extension)
 
 {DIVIDER}
       Select an option below
@@ -218,6 +242,21 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     1. Select CSV→TXT
     2. Send a CSV file
     3. Receive TXT file
+
+  ► RM COMMON
+    1. Select RM COMMON
+    2. Send 2 text files
+    3. Lines common to BOTH
+       files are removed
+    4. Receive 2 output files
+       (one per input)
+
+  ► RENAME
+    1. Select RENAME
+    2. Send any file
+    3. Type a new full filename
+       (incl. extension, e.g. .py)
+    4. Receive file with new name
 
   ► COMMANDS
     /start  - Main menu
@@ -309,6 +348,8 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
   ◈ SPLITTER - Split files
   ◈ MAKE TXT - Text to file
   ◈ CSV→TXT  - Convert CSV
+  ◈ RM COMMON - Remove common lines
+  ◈ RENAME   - Rename any file
 
 {DIVIDER}
       Select an option below
@@ -342,6 +383,20 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     2. Send text messages
     3. Click CREATE TXT
     4. Receive TXT file
+
+  ► RM COMMON
+    1. Select RM COMMON
+    2. Send 2 text files
+    3. Lines common to BOTH
+       files are removed
+    4. Receive 2 output files
+
+  ► RENAME
+    1. Select RENAME
+    2. Send any file
+    3. Type a new full filename
+       (incl. extension, e.g. .py)
+    4. Receive file with new name
 
   ► NOTE
     Duplicates removed automatically
@@ -593,6 +648,96 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         context.user_data.clear()
         return await button_callback_menu(update, context)
     
+    # ─────────────────────────────────────────────────────────────────────────
+    # REMOVE COMMON LINES
+    # ─────────────────────────────────────────────────────────────────────────
+    
+    elif data == "removedupe":
+        context.user_data["removedupe_files"] = []
+        context.user_data["mode"] = "removedupe"
+        
+        text = f"""
+{HEADER}
+
+          REMOVE COMMON LINES
+
+{DIVIDER}
+
+  ► Sends TWO text files
+  ► Lines common to both are
+    REMOVED from each output
+  ► Whitespace trimmed when
+    matching; order preserved
+  ► Output: 2 separate files
+
+  Files received: 0
+
+{DIVIDER}
+      Send your files below
+{DIVIDER}"""
+        
+        await query.edit_message_text(text, reply_markup=removedupe_keyboard())
+        return REMOVEDUPE_WAITING_FILE1
+    
+    elif data == "clear_removedupe":
+        context.user_data["removedupe_files"] = []
+        text = f"""
+{HEADER}
+
+          REMOVE COMMON LINES
+
+{DIVIDER}
+
+  ► Files cleared!
+  ► Send new text files
+
+  Files received: 0
+
+{DIVIDER}
+      Send your files below
+{DIVIDER}"""
+        await query.edit_message_text(text, reply_markup=removedupe_keyboard())
+        return REMOVEDUPE_WAITING_FILE1
+    
+    elif data == "cancel_removedupe":
+        context.user_data.clear()
+        return await button_callback_menu(update, context)
+    
+    # ─────────────────────────────────────────────────────────────────────────
+    # RENAME
+    # ─────────────────────────────────────────────────────────────────────────
+    
+    elif data == "rename":
+        context.user_data["mode"] = "rename"
+        context.user_data["rename_file"] = None
+        
+        text = f"""
+{HEADER}
+
+             RENAME
+
+{DIVIDER}
+
+  ► Send ANY file to rename
+  ► Then type the NEW full
+    filename (incl. extension,
+    e.g. .txt, .py, .csv)
+  ► No validation enforced
+
+  Waiting for file...
+
+{DIVIDER}
+       Send your file below
+{DIVIDER}"""
+        
+        keyboard = [[InlineKeyboardButton("◄ CANCEL", callback_data="cancel_rename")]]
+        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+        return RENAME_WAITING_FILE
+    
+    elif data == "cancel_rename":
+        context.user_data.clear()
+        return await button_callback_menu(update, context)
+    
     return ConversationHandler.END
 
 async def button_callback_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -611,6 +756,8 @@ async def button_callback_menu(update: Update, context: ContextTypes.DEFAULT_TYP
   ◈ SPLITTER - Split files
   ◈ MAKE TXT - Text to file
   ◈ CSV→TXT  - Convert CSV
+  ◈ RM COMMON - Remove common lines
+  ◈ RENAME   - Rename any file
 
 {DIVIDER}
       Select an option below
@@ -1166,6 +1313,282 @@ async def handle_csvtotxt_file(update: Update, context: ContextTypes.DEFAULT_TYP
     return ConversationHandler.END
 
 # ═══════════════════════════════════════════════════════════════════════════════
+#                              REMOVE COMMON LINES
+# ═══════════════════════════════════════════════════════════════════════════════
+
+async def handle_removedupe_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Handle file uploads for remove-common-lines feature."""
+    document = update.message.document
+    if not document:
+        await update.message.reply_text("Please send a valid file.")
+        return REMOVEDUPE_WAITING_FILE1 if len(context.user_data.get("removedupe_files", [])) == 0 else REMOVEDUPE_WAITING_FILE2
+    
+    # Accept any text-based file: skip files that look binary by checking size sanity
+    if document.file_size > 20 * 1024 * 1024:
+        await update.message.reply_text(
+            "⚠ File too large! Maximum size is 20MB.",
+            reply_markup=removedupe_keyboard()
+        )
+        return REMOVEDUPE_WAITING_FILE1 if len(context.user_data.get("removedupe_files", [])) == 0 else REMOVEDUPE_WAITING_FILE2
+    
+    try:
+        file = await document.get_file()
+        file_content = await file.download_as_bytearray()
+    except Exception:
+        await update.message.reply_text(
+            "⚠ Failed to download file. Try a smaller file.",
+            reply_markup=removedupe_keyboard()
+        )
+        return REMOVEDUPE_WAITING_FILE1 if len(context.user_data.get("removedupe_files", [])) == 0 else REMOVEDUPE_WAITING_FILE2
+    
+    files = context.user_data.get("removedupe_files", [])
+    files.append({
+        "name": document.file_name,
+        "content": file_content.decode("utf-8", errors="ignore")
+    })
+    context.user_data["removedupe_files"] = files
+    
+    count = len(files)
+    file_list = "\n".join([f"  {i+1}. {f['name'][:30]}" for i, f in enumerate(files)])
+    
+    if count < 2:
+        text = f"""
+{HEADER}
+
+        REMOVE COMMON LINES
+
+{DIVIDER}
+  Files received: {count}
+{DIVIDER}
+
+{file_list}
+
+{DIVIDER}
+    Send file 2 below to proceed
+{DIVIDER}"""
+        await update.message.reply_text(text, reply_markup=removedupe_keyboard())
+        return REMOVEDUPE_WAITING_FILE2
+    
+    # Two files collected -> process
+    await do_removedupe(update, context)
+    return ConversationHandler.END
+
+async def do_removedupe(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Process two files: remove lines common to both; send two output files."""
+    files = context.user_data.get("removedupe_files", [])
+    if len(files) < 2:
+        await update.message.reply_text("⚠ Need exactly 2 files to process.", reply_markup=back_keyboard())
+        context.user_data.clear()
+        return
+    
+    status_msg = await update.message.reply_text(f"""
+{HEADER}
+
+          PROCESSING
+
+{DIVIDER}
+
+      ▓▓▓▓▓▓░░░░ 50%
+
+   Removing common lines...
+
+{DIVIDER}""")
+    
+    lines1 = files[0]["content"].splitlines()
+    lines2 = files[1]["content"].splitlines()
+    
+    trimmed_set1 = {line.strip() for line in lines1}
+    trimmed_set2 = {line.strip() for line in lines2}
+    common = trimmed_set1 & trimmed_set2
+    
+    out1 = [line for line in lines1 if line.strip() not in common]
+    out2 = [line for line in lines2 if line.strip() not in common]
+    
+    out1_content = "\n".join(out1)
+    if out1_content and not out1_content.endswith("\n"):
+        out1_content += "\n"
+    out2_content = "\n".join(out2)
+    if out2_content and not out2_content.endswith("\n"):
+        out2_content += "\n"
+    
+    common_count = len(common)
+    
+    # Send file 1 result
+    base1 = os.path.splitext(files[0]["name"])[0]
+    base2 = os.path.splitext(files[1]["name"])[0]
+    
+    with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False, encoding='utf-8') as tmp:
+        tmp.write(out1_content)
+        tmp_path1 = tmp.name
+    with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False, encoding='utf-8') as tmp:
+        tmp.write(out2_content)
+        tmp_path2 = tmp.name
+    
+    result_text = f"""
+{HEADER}
+
+           COMPLETED
+
+{DIVIDER}
+
+  ► Files in: 2
+  ► File 1 lines: {len(out1)} (of {len(lines1)})
+  ► File 2 lines: {len(out2)} (of {len(lines2)})
+  ► Common removed: {common_count}
+  ► Output: 2 TXT files
+
+{DIVIDER}"""
+    
+    await status_msg.edit_text(result_text, reply_markup=back_keyboard())
+    
+    with open(tmp_path1, 'rb') as f:
+        await update.message.reply_document(
+            document=f,
+            filename=f"{base1}_unique.txt",
+            caption=f"► File 1 (common removed)"
+        )
+    os.unlink(tmp_path1)
+    await asyncio.sleep(0.3)
+    
+    with open(tmp_path2, 'rb') as f:
+        await update.message.reply_document(
+            document=f,
+            filename=f"{base2}_unique.txt",
+            caption=f"► File 2 (common removed)"
+        )
+    os.unlink(tmp_path2)
+    
+    context.user_data.clear()
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#                              RENAME
+# ═══════════════════════════════════════════════════════════════════════════════
+
+async def handle_rename_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Handle file upload for rename feature (any file type)."""
+    document = update.message.document
+    if not document:
+        await update.message.reply_text("Please send a valid file.")
+        return RENAME_WAITING_FILE
+    
+    if document.file_size > 20 * 1024 * 1024:
+        keyboard = [[InlineKeyboardButton("◄ CANCEL", callback_data="cancel_rename")]]
+        await update.message.reply_text(
+            "⚠ File too large! Maximum size is 20MB.",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+        return RENAME_WAITING_FILE
+    
+    try:
+        file = await document.get_file()
+        file_content = await file.download_as_bytearray()
+    except Exception:
+        keyboard = [[InlineKeyboardButton("◄ CANCEL", callback_data="cancel_rename")]]
+        await update.message.reply_text(
+            "⚠ Failed to download file. Try a smaller file.",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+        return RENAME_WAITING_FILE
+    
+    size_kb = len(file_content) / 1024
+    context.user_data["rename_file"] = {
+        "name": document.file_name or "file",
+        "content": bytes(file_content),
+        "size": len(file_content)
+    }
+    
+    text = f"""
+{HEADER}
+
+             RENAME
+
+{DIVIDER}
+
+  ► File: {document.file_name[:30] if document.file_name else 'file'}
+  ► Size: {size_kb:.1f} KB
+
+  Now type the NEW full filename
+  (including extension, e.g. .txt,
+  .py, .csv, .html, etc.)
+
+  ► No validation enforced
+  ► No extension auto-appended
+  ► Use EXACTLY what you type
+
+{DIVIDER}
+       Type the new name below
+{DIVIDER}"""
+    
+    keyboard = [[InlineKeyboardButton("◄ CANCEL", callback_data="cancel_rename")]]
+    await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+    return RENAME_WAITING_NAME
+
+async def handle_rename_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Handle the new filename input and send renamed file back."""
+    new_name = update.message.text.strip()
+    
+    file_data = context.user_data.get("rename_file")
+    if not file_data:
+        keyboard = [[InlineKeyboardButton("◄ BACK TO MENU", callback_data="menu")]]
+        await update.message.reply_text(
+            "⚠ No file to rename. Please start over with /start.",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+        return ConversationHandler.END
+    
+    if not new_name:
+        keyboard = [[InlineKeyboardButton("◄ CANCEL", callback_data="cancel_rename")]]
+        await update.message.reply_text(
+            "⚠ Filename cannot be empty. Type a new filename below.",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+        return RENAME_WAITING_NAME
+    
+    status_msg = await update.message.reply_text(f"""
+{HEADER}
+
+          PROCESSING
+
+{DIVIDER}
+
+      ▓▓▓▓▓▓░░░░ 50%
+
+   Renaming file...
+
+{DIVIDER}""")
+    
+    ext = os.path.splitext(new_name)[1]
+    with tempfile.NamedTemporaryFile(mode='wb', suffix=ext, delete=False) as tmp:
+        tmp.write(file_data["content"])
+        tmp_path = tmp.name
+    
+    result_text = f"""
+{HEADER}
+
+           COMPLETED
+
+{DIVIDER}
+
+  ► Original: {file_data['name'][:30]}
+  ► New name: {new_name[:30]}
+  ► Size: {file_data['size']/1024:.1f} KB
+
+{DIVIDER}"""
+    
+    await status_msg.edit_text(result_text, reply_markup=back_keyboard())
+    
+    with open(tmp_path, 'rb') as f:
+        await update.message.reply_document(
+            document=f,
+            filename=new_name,
+            caption=f"► Renamed: {file_data['name']} → {new_name}"
+        )
+    os.unlink(tmp_path)
+    
+    context.user_data.clear()
+    return ConversationHandler.END
+
+# ═══════════════════════════════════════════════════════════════════════════════
 #                              FALLBACK HANDLERS
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -1232,6 +1655,22 @@ def main() -> None:
             ],
             CSVTOTXT_WAITING: [
                 MessageHandler(filters.Document.ALL, handle_csvtotxt_file),
+                CallbackQueryHandler(button_callback),
+            ],
+            REMOVEDUPE_WAITING_FILE1: [
+                MessageHandler(filters.Document.ALL, handle_removedupe_file),
+                CallbackQueryHandler(button_callback),
+            ],
+            REMOVEDUPE_WAITING_FILE2: [
+                MessageHandler(filters.Document.ALL, handle_removedupe_file),
+                CallbackQueryHandler(button_callback),
+            ],
+            RENAME_WAITING_FILE: [
+                MessageHandler(filters.Document.ALL, handle_rename_file),
+                CallbackQueryHandler(button_callback),
+            ],
+            RENAME_WAITING_NAME: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_rename_name),
                 CallbackQueryHandler(button_callback),
             ],
         },
